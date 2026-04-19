@@ -16,6 +16,8 @@ def sample_trajectory(
 ) -> Dict[str, np.ndarray]:
     """Sample a rollout in the environment from a policy."""
     ob = env.reset()
+    if isinstance(ob, tuple):
+        ob = ob[0]
     obs, acs, rewards, next_obs, terminals, image_obs = [], [], [], [], [], []
     steps = 0
     while True:
@@ -29,17 +31,30 @@ def sample_trajectory(
                 cv2.resize(img, dsize=(250, 250), interpolation=cv2.INTER_CUBIC)
             )
 
-        # TODO use the most recent ob to decide what to do
-        ac = None
+        # Choose one action from the current observation.
+        # For discrete envs like CartPole, ac is a scalar integer action.
+        # For continuous envs, ac is an array with shape (ac_dim,).
+        ac = policy.get_action(ob)
 
-        # TODO: take that action and get reward and next ob
-        next_ob, rew, done, info = None, None, None, None
+        # Apply that one action for one environment timestep.
+        # Old Gym returns: (next_ob, rew, done, info).
+        # New Gym/Gymnasium returns: (next_ob, rew, terminated, truncated, info).
+        step_result = env.step(ac)
+        if len(step_result) == 5:
+            next_ob, rew, terminated, truncated, info = step_result
+            done = terminated or truncated
+        else:
+            next_ob, rew, done, info = step_result
 
-        # TODO rollout can end due to done, or due to max_length
         steps += 1
-        rollout_done = None
+        # End the rollout if the environment is done or if we hit the episode length cap.
+        rollout_done = done or steps >= max_length
 
-        # record result of taking that action
+        # Record one transition from the current timestep.
+        # For CartPole: ob and next_ob have shape (4,), ac is a scalar, rew is a scalar,
+        # and rollout_done is a scalar bool. More generally, ob/next_ob have shape
+        # env.observation_space.shape, while ac is scalar for discrete actions or
+        # shape (ac_dim,) for continuous actions.
         obs.append(ob)
         acs.append(ac)
         rewards.append(rew)
@@ -53,8 +68,12 @@ def sample_trajectory(
             break
 
     return {
+        # If this trajectory has length T, shapes are usually:
+        # observation: (T, *ob_shape), action: (T,) for discrete or (T, ac_dim)
+        # for continuous, reward: (T,), next_observation: (T, *ob_shape),
+        # terminal: (T,).
         "observation": np.array(obs, dtype=np.float32),
-        "image_obs": np.array(image_obs, dtype=np.uint8),
+        "image_obs": np.array(image_obs, dtype=np.uint8),  # (T, 250, 250, 3)
         "reward": np.array(rewards, dtype=np.float32),
         "action": np.array(acs, dtype=np.float32),
         "next_observation": np.array(next_obs, dtype=np.float32),

@@ -59,17 +59,40 @@ def run_training_loop(logger, args):
 
     for itr in range(args.n_iter):
         print(f"\n********** Iteration {itr} ************")
-        # TODO: sample `args.batch_size` transitions using utils.sample_trajectories
-        # make sure to use `max_ep_len`
-        trajs, envsteps_this_batch = None, None
+        trajs, envsteps_this_batch = utils.sample_trajectories(
+            env, agent.actor, args.batch_size, max_ep_len
+        )
         total_envsteps += envsteps_this_batch
 
-        # trajs should be a list of dictionaries of NumPy arrays, where each dictionary corresponds to a trajectory.
-        # this line converts this into a single dictionary of lists of NumPy arrays.
+        # Each traj is one rollout. Example for CartPole, ob_dim=4.
+        # The 3 and 5 below are T_0 and T_1: the number of env steps in each rollout.
+        # trajs[0]["observation"].shape == (3, 4), trajs[0]["action"].shape == (3,)
+        # trajs[1]["observation"].shape == (5, 4), trajs[1]["action"].shape == (5,)
+        # Within one traj: trajs[0]["observation"][2] pairs with trajs[0]["action"][2].
+        #
+        # Convert from a list of trajs to per-key lists:
+        # [{"observation": obs_0, "action": acs_0}, {"observation": obs_1, "action": acs_1}]
+        # -> {"observation": [obs_0, obs_1], "action": [acs_0, acs_1]}
+        # Shapes after this line:
+        # trajs_dict["observation"] is a list: [array(3, 4), array(5, 4)]
+        # trajs_dict["action"] is a list: [array(3,), array(5,)]
         trajs_dict = {k: [traj[k] for traj in trajs] for k in trajs[0]}
 
-        # TODO: train the agent using the sampled trajectories and the agent's update function
-        train_info: dict = None
+        # agent.update receives lists of per-trajectory arrays.
+        # T_i is the length of trajectory i, not the full update batch size.
+        # The update batch size is sum_i T_i, after PGAgent.update concatenates
+        # all trajectories into one flat batch.
+        # For trajectory i:
+        # - observation[i] has shape (T_i, ob_dim)
+        # - action[i] has shape (T_i,) for discrete or (T_i, ac_dim) for continuous
+        # - reward[i] has shape (T_i,)
+        # - terminal[i] has shape (T_i,), with True/1 at the final step of that trajectory
+        train_info: dict = agent.update(
+            trajs_dict["observation"],
+            trajs_dict["action"],
+            trajs_dict["reward"],
+            trajs_dict["terminal"],
+        )
 
         if itr % args.scalar_log_freq == 0:
             # save eval metrics

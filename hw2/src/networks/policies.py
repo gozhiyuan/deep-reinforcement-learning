@@ -30,6 +30,13 @@ class MLPPolicy(nn.Module):
         super().__init__()
 
         if discrete:
+            # Discrete action spaces have a fixed set of action IDs.
+            # Example: CartPole has ac_dim=2, with actions 0=left and 1=right.
+            # Input shape to this network:  (batch_size, ob_dim)
+            # Output shape from this network: (batch_size, ac_dim)
+            # The outputs are logits, not probabilities. A Categorical distribution
+            # will later apply softmax internally when sampling/log-probabilities
+            # are needed.
             self.logits_net = ptu.build_mlp(
                 input_size=ob_dim,
                 output_size=ac_dim,
@@ -38,12 +45,19 @@ class MLPPolicy(nn.Module):
             ).to(ptu.device)
             parameters = self.logits_net.parameters()
         else:
+            # Continuous action spaces need one real-valued action vector.
+            # Example: if ac_dim=3, each action has shape (3,).
+            # Input shape to this network:  (batch_size, ob_dim)
+            # Output shape from this network: (batch_size, ac_dim)
+            # The network predicts the Gaussian mean for each action dimension.
             self.mean_net = ptu.build_mlp(
                 input_size=ob_dim,
                 output_size=ac_dim,
                 n_layers=n_layers,
                 size=layer_size,
             ).to(ptu.device)
+            # logstd is a learned parameter shared across observations.
+            # Shape: (ac_dim,). After exp(logstd), it becomes the Gaussian std.
             self.logstd = nn.Parameter(
                 torch.zeros(ac_dim, dtype=torch.float32, device=ptu.device)
             )
@@ -59,10 +73,26 @@ class MLPPolicy(nn.Module):
     @torch.no_grad()
     def get_action(self, obs: np.ndarray) -> np.ndarray:
         """Takes a single observation (as a numpy array) and returns a single action (as a numpy array)."""
-        # TODO: implement get_action
-        action = None
+        # The policy network expects a batch dimension. A single observation has
+        # shape (ob_dim,), so convert it to shape (1, ob_dim).
+        if obs.ndim == 1:
+            obs = obs[None]
 
-        return action
+        # forward(...) returns a torch Distribution object:
+        # - discrete: a Categorical distribution over action IDs
+        # - continuous: a Gaussian distribution over action vectors
+        # Sampling gives one action per observation in the batch.
+        # Before removing the batch dimension:
+        # - discrete action shape: (1,)
+        # - continuous action shape: (1, ac_dim)
+        action_distribution = self.forward(ptu.from_numpy(obs))
+        action = action_distribution.sample()
+
+        # Remove the batch dimension before giving the action to env.step(...).
+        # Returned shape:
+        # - discrete: scalar action ID, like 0 or 1
+        # - continuous: array with shape (ac_dim,)
+        return ptu.to_numpy(action)[0]
 
     def forward(self, obs: torch.FloatTensor):
         """
@@ -71,11 +101,21 @@ class MLPPolicy(nn.Module):
         flexible objects, such as a `torch.distributions.Distribution` object. It's up to you!
         """
         if self.discrete:
-            # TODO: define the forward pass for a policy with a discrete action space.
-            pass
+            # logits shape: (batch_size, ac_dim)
+            # sample() shape: (batch_size,), containing integer action IDs.
+            # log_prob(actions) shape: (batch_size,), one log-prob per sampled ID.
+            logits = self.logits_net(obs)
+            return D.Categorical(logits=logits)
         else:
-            # TODO: define the forward pass for a policy with a continuous action space.
-            pass
+            # mean shape: (batch_size, ac_dim)
+            # std shape: (ac_dim,), broadcast across the batch.
+            # sample() shape: (batch_size, ac_dim), containing full action vectors.
+            # log_prob(actions) should still be shape (batch_size,), one log-prob
+            # per full action vector. Independent sums the per-dimension Normal
+            # log-probs into that one value per action vector.
+            mean = self.mean_net(obs)
+            std = torch.exp(self.logstd)
+            return D.Independent(D.Normal(mean, std), 1)
 
     def update(self, obs: np.ndarray, actions: np.ndarray, *args, **kwargs) -> dict:
         """
@@ -95,15 +135,44 @@ class MLPPolicyPG(MLPPolicy):
         advantages: np.ndarray,
     ) -> dict:
         """Implements the policy gradient actor update."""
+        # Inputs are already concatenated across trajectories by PGAgent.update.
+        # Let B = batch_size = total number of env steps in the collected batch.
+        # - obs: (B, ob_dim)
+        # - actions: (B,) for discrete or (B, ac_dim) for continuous
+        # - advantages: (B,), one scalar weight per sampled action
+        #
+        # ptu.from_numpy converts NumPy arrays to torch float tensors and moves
+        # them to ptu.device, which is CPU or GPU depending on init_gpu(...).
         obs = ptu.from_numpy(obs)
         actions = ptu.from_numpy(actions)
         advantages = ptu.from_numpy(advantages)
 
-        # TODO: compute the policy gradient actor loss
-        loss = None
+        # This is not another rollout in the environment. We are re-running the
+        # policy network on the old collected observations to get pi_theta(.|s_t),
+        # then evaluating the log-probability of the actions that were actually
+        # sampled during rollout.
+        action_distribution = self.forward(obs)
+        if self.discrete:
+            # CartPole example: actions [1.0, 0.0, 1.0] -> [1, 0, 1].
+            actions = actions.long()
 
-        # TODO: perform an optimizer step
-        pass
+        # Example probs for actions [1, 0, 1]:
+        # obs[0]: [left=0.4, right=0.6] -> log_probs[0] = log(0.6)
+        # obs[1]: [left=0.7, right=0.3] -> log_probs[1] = log(0.7)
+        # obs[2]: [left=0.2, right=0.8] -> log_probs[2] = log(0.8)
+        log_probs = action_distribution.log_prob(actions)
+
+        # Example:
+        # log_probs = [log(0.6), log(0.7), log(0.8)]
+        # advantages = [2.0, -1.0, 3.0]
+        # Positive advantage -> make that sampled action more likely.
+        # Negative advantage -> make that sampled action less likely.
+        # Negative sign because PyTorch minimizes loss, but PG maximizes reward.
+        loss = -(log_probs * advantages).mean()
+
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
 
         return {
             "Actor Loss": loss.item(),
