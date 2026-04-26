@@ -48,6 +48,11 @@ def basic_dqn_config(
     ) -> torch.optim.lr_scheduler._LRScheduler:
         return torch.optim.lr_scheduler.ConstantLR(optimizer, factor=1.0)
 
+    # Epsilon schedule for epsilon-greedy exploration.
+    # Example with total_steps=1_000_000:
+    #   step 0       -> epsilon 1.00  (fully random actions)
+    #   step 300_000 -> epsilon 0.10
+    #   step 600_000 -> epsilon 0.02  (mostly greedy)
     exploration_schedule = PiecewiseSchedule(
         [
             (0, 1.0),
@@ -149,6 +154,11 @@ def atari_dqn_config(
             ).value,
         )
 
+    # Epsilon schedule for Atari epsilon-greedy exploration.
+    # Example with total_steps=1_000_000:
+    #   steps 0..20_000 -> epsilon 1.00  (collect random experience first)
+    #   step 500_000    -> epsilon 0.01
+    #   later steps     -> epsilon 0.01
     exploration_schedule = PiecewiseSchedule(
         [
             (0, 1.0),

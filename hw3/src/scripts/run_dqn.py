@@ -53,6 +53,17 @@ def run_training_loop(config: dict, logger: Logger, args: argparse.Namespace):
     observation = None
 
     # Replay buffer
+    #
+    # State-based tasks such as CartPole have flat observations, e.g. shape (4,).
+    # For those, store each transition directly:
+    #   (obs, action, reward, next_obs, done)
+    #
+    # Pixel-based Atari tasks use stacked image frames, e.g. shape (4, 84, 84).
+    # Consecutive stacked observations overlap heavily:
+    #   obs      = [f0, f1, f2, f3]
+    #   next_obs = [f1, f2, f3, f4]
+    # The memory-efficient buffer stores individual frames once and reconstructs
+    # stacked observations by indexing into its frame buffer.
     if len(env.observation_space.shape) == 3:
         stacked_frames = True
         frame_history_len = env.observation_space.shape[0]
@@ -84,15 +95,26 @@ def run_training_loop(config: dict, logger: Logger, args: argparse.Namespace):
     reset_env_training()
 
     for step in tqdm.trange(config["total_steps"], dynamic_ncols=True):
+        # Epsilon is the random-action probability in epsilon-greedy DQN.
+        # The config's piecewise schedule usually decays it from high
+        # exploration early in training toward mostly greedy actions later.
         epsilon = exploration_schedule.value(step)
 
-        # TODO(Section 2.4): Compute action
-        action = None
-        # ENDTODO
+        action = agent.get_action(observation, epsilon)
 
+        # Old Gym step API returns:
+        #   next_observation: same shape as observation, e.g. (4,) for CartPole
+        #                     or (4, 84, 84) for Atari frame stacks
+        #   reward: scalar float
+        #   done: bool, True when the episode ended or hit the time limit
+        #   info: dict with wrapper metadata, e.g. episode stats and truncation
         next_observation, reward, done, info = env.step(action)
         next_observation = np.asarray(next_observation)
 
+        # Gym's TimeLimit wrapper stores time-limit endings in info instead of
+        # a separate return value in the old API. A truncated episode stopped
+        # because max_episode_steps was reached, not because the environment
+        # reached a true terminal state.
         truncated = info.get("TimeLimit.truncated", False)
 
         if isinstance(replay_buffer, MemoryEfficientReplayBuffer):
@@ -118,24 +140,42 @@ def run_training_loop(config: dict, logger: Logger, args: argparse.Namespace):
         if done:
             reset_env_training()
 
+            # RecordEpisodeStatistics adds info["episode"] when an episode ends:
+            #   info["episode"]["r"] = total reward accumulated in this episode
+            #   info["episode"]["l"] = episode length in environment steps
             logger.log({
                 "Train_EpisodeReturn": info["episode"]["r"],
                 "Train_EpisodeLen": info["episode"]["l"],
             }, step)
         else:
+            # Continue the same episode: the next state from this step becomes
+            # the current state used to choose the next action.
             observation = next_observation
 
         # Main DQN training loop
         if step >= config["learning_starts"]:
-            # TODO(Section 2.4): Sample config["batch_size"] samples from the replay buffer
-            batch = None
-            # ENDTODO
+            # Sample a random minibatch of individual transitions from replay.
+            # This is not one full episode; a batch can mix steps from many
+            # episodes. It can also include only one transition from a given
+            # episode, which is enough for one-step DQN TD learning:
+            #   (obs_t, action_t, reward_t, next_obs_t, done_t)
+            # Example shapes:
+            #   CartPole batch_size=128 -> observations: (128, 4)
+            #   Atari batch_size=32     -> observations: (32, 4, 84, 84)
+            batch = replay_buffer.sample(config["batch_size"])
 
+            # Convert every numpy array in the batch dict to a torch tensor on
+            # the configured device; keys/shapes stay the same.
             batch = ptu.from_numpy(batch)
 
-            # TODO(Section 2.4): Train the agent.
-            update_info = None
-            # ENDTODO
+            update_info = agent.update(
+                batch["observations"],
+                batch["actions"],
+                batch["rewards"],
+                batch["next_observations"],
+                batch["dones"],
+                step,
+            )
 
             # Logging code
             update_info["epsilon"] = epsilon

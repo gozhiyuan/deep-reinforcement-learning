@@ -45,11 +45,14 @@ class DQNAgent(nn.Module):
         """
         Epsilon-greedy action selection (default epsilon=0 for deterministic/greedy policy).
         """
+        if np.random.random() < epsilon:
+            return int(np.random.randint(self.num_actions))
+
         observation = ptu.from_numpy(np.asarray(observation))[None]
 
-        # TODO(Section 2.4): get the action from the critic using an epsilon-greedy strategy
-        action = None
-        # ENDTODO
+        with torch.no_grad():
+            qa_values = self.critic(observation)
+            action = torch.argmax(qa_values, dim=1)
 
         return ptu.to_numpy(action).squeeze(0).item()
 
@@ -62,32 +65,53 @@ class DQNAgent(nn.Module):
         done: torch.Tensor,
     ) -> dict:
         """Update the DQN critic, and return stats for logging."""
+        # Batch shapes:
+        #   obs:      (B, *observation_shape), e.g. (32, 4, 84, 84)
+        #   action:   (B,), integer action taken in each sampled transition
+        #   reward:   (B,), scalar reward from env.step(action)
+        #   next_obs: (B, *observation_shape)
+        #   done:     (B,), True only for real terminal transitions
         (batch_size,) = reward.shape
 
-        # Compute target values
+        # Compute TD targets without backpropagating through the target network.
+        # For each transition:
+        #   target = reward + discount * (1 - done) * Q_target(next_obs, best_next_action)
         with torch.no_grad():
-            # TODO(Section 2.4): compute target values
-            next_qa_values = None
+            # Q-values for all actions at the next states: shape (B, num_actions).
+            next_qa_values = self.target_critic(next_obs)
 
             if self.use_double_q:
-                # TODO(Section 2.5): implement double-Q target action selection
-                next_action = None
+                # Double DQN: choose the best next action with the current critic,
+                # but evaluate that action with the target critic below.
+                next_action = torch.argmax(self.critic(next_obs), dim=1)
             else:
-                next_action = None
+                # Standard DQN: choose and evaluate the best action with target critic.
+                next_action = torch.argmax(next_qa_values, dim=1)
 
-            next_q_values = None
+            # Select Q_target(next_obs_i, next_action_i) from each row.
+            # next_action[:, None] has shape (B, 1), gather returns (B, 1).
+            next_q_values = torch.gather(
+                next_qa_values, dim=1, index=next_action[:, None]
+            ).squeeze(1)
             assert next_q_values.shape == (batch_size,), next_q_values.shape
 
-            target_values = None
+            # If done=True, there is no future value, so only reward remains.
+            target_values = reward + self.discount * (1 - done.float()) * next_q_values
             assert target_values.shape == (batch_size,), target_values.shape
-            # ENDTODO
 
-        # TODO(Section 2.4): train the critic with the target values
-        qa_values = None
-        q_values = None
-        loss = None
-        # ENDTODO
+        # Current critic predictions for all actions at sampled states:
+        # shape (B, num_actions).
+        qa_values = self.critic(obs)
+        # Keep only Q_current(obs_i, action_i), the value of the action that was
+        # actually taken in the replay transition.
+        q_values = torch.gather(
+            qa_values, dim=1, index=action.long()[:, None]
+        ).squeeze(1)
 
+        # Fit current Q-values toward the TD targets.
+        loss = self.critic_loss(q_values, target_values)
+
+        # One optimizer step on the current critic network.
         self.critic_optimizer.zero_grad()
         loss.backward()
         grad_norm = torch.nn.utils.clip_grad.clip_grad_norm_(
@@ -97,6 +121,7 @@ class DQNAgent(nn.Module):
 
         self.lr_scheduler.step()
 
+        # Return scalar training diagnostics; these are logged by run_dqn.py.
         return {
             "critic_loss": loss.item(),
             "q_values": q_values.mean().item(),
@@ -119,9 +144,11 @@ class DQNAgent(nn.Module):
         """
         Update the DQN agent, including both the critic and target.
         """
-        # TODO(Section 2.4): update the critic, and the target if needed
-        critic_stats = None
-        # Hint: if step % self.target_update_period == 0: ...
-        # ENDTODO
+        # Update the online/current critic every training step.
+        critic_stats = self.update_critic(obs, action, reward, next_obs, done)
+        if step % self.target_update_period == 0:
+            # Periodically sync the slower target critic to the current critic.
+            # This stabilizes bootstrapped TD targets.
+            self.update_target_critic()
 
         return critic_stats

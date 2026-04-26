@@ -12,6 +12,9 @@ class ReplayBuffer:
         self.dones = None
 
     def sample(self, batch_size):
+        # Pick random transition indices from the filled part of the buffer.
+        # Example: if size == 10_000 and batch_size == 128, this returns 128
+        # random rows from observations/actions/rewards/next_observations/dones.
         rand_indices = np.random.randint(0, self.size, size=(batch_size,)) % self.max_size
         return {
             "observations": self.observations[rand_indices],
@@ -45,6 +48,9 @@ class ReplayBuffer:
                 done=done,
             )
         """
+        # Convert scalar Python values into 0-d numpy arrays, so the storage
+        # arrays can be allocated with consistent dtypes and shapes.
+        # Example: action=1 becomes np.array(1, dtype=np.int64), whose shape is ().
         if isinstance(reward, (float, int)):
             reward = np.array(reward)
         if isinstance(done, bool):
@@ -52,6 +58,13 @@ class ReplayBuffer:
         if isinstance(action, int):
             action = np.array(action, dtype=np.int64)
 
+        # Lazily allocate storage on the first insert because only then do we
+        # know the exact observation/action shapes and dtypes from the env.
+        # CartPole example:
+        #   observations      -> (1_000_000, 4)
+        #   actions           -> (1_000_000,)
+        #   rewards/dones     -> (1_000_000,)
+        #   next_observations -> (1_000_000, 4)
         if self.observations is None:
             self.observations = np.empty(
                 (self.max_size, *observation.shape), dtype=observation.dtype
@@ -69,6 +82,8 @@ class ReplayBuffer:
         assert next_observation.shape == self.next_observations.shape[1:]
         assert done.shape == ()
 
+        # Ring-buffer write: after max_size inserts, new transitions overwrite
+        # the oldest ones at index size % max_size.
         self.observations[self.size % self.max_size] = observation
         self.actions[self.size % self.max_size] = action
         self.rewards[self.size % self.max_size] = reward
@@ -81,6 +96,14 @@ class ReplayBuffer:
 class MemoryEfficientReplayBuffer:
     """
     A memory-efficient version of the replay buffer for when observations are stacked.
+
+    Atari observations are stacks of recent frames, e.g. shape (4, 84, 84):
+        obs      = [f0, f1, f2, f3]
+        next_obs = [f1, f2, f3, f4]
+
+    Storing both full stacks would duplicate f1, f2, and f3. Instead, this
+    buffer stores single frames in `framebuffer` and stores arrays of frame
+    indices that describe each stacked observation.
     """
 
     def __init__(self, frame_history_len: int, capacity=1000000):
@@ -94,22 +117,42 @@ class MemoryEfficientReplayBuffer:
 
         self.frame_history_len = frame_history_len
         self.size = 0
+        # Transition arrays, allocated on first insert.
+        # Example shapes for discrete Atari actions:
+        #   actions/rewards/dones: (capacity,)
         self.actions = None
         self.rewards = None
         self.dones = None
 
+        # Per-transition frame histories, allocated on first reset.
+        # Example with capacity=1e6 and frame_history_len=4:
+        #   observation_framebuffer_idcs:      (1_000_000, 4)
+        #   next_observation_framebuffer_idcs: (1_000_000, 4)
+        # Each row stores indices into framebuffer, not image pixels.
         self.observation_framebuffer_idcs = None
         self.next_observation_framebuffer_idcs = None
+
+        # Individual frames, not stacked observations.
+        # Example for 84x84 Atari frames:
+        #   framebuffer:       (2_000_000, 84, 84)
+        #   observation_shape: (84, 84)
         self.framebuffer = None
         self.observation_shape = None
 
+        # Episode boundary bookkeeping. These are scalar indices used to avoid
+        # constructing frame stacks that cross from one episode into the next.
         self.current_trajectory_begin = None
         self.current_trajectory_framebuffer_begin = None
         self.framebuffer_idx = None
 
+        # Framebuffer indices for the current observation stack.
+        # Example: [10, 11, 12, 13] represents obs=[f10, f11, f12, f13].
         self.recent_observation_framebuffer_idcs = None
 
     def sample(self, batch_size):
+        # Sample transition rows, then look up the frame-index histories for
+        # each row. The final observations returned to the agent still have
+        # normal stacked shape, e.g. (batch_size, 4, 84, 84).
         rand_indices = (
             np.random.randint(0, self.size, size=(batch_size,)) % self.max_size
         )
@@ -158,6 +201,13 @@ class MemoryEfficientReplayBuffer:
         frame history for the given latest frame index and trajectory begin index.
 
         Indices are into the observation buffer, not the regular buffers.
+
+        Example with frame_history_len = 4:
+            latest_framebuffer_idx = 7 -> desired history [4, 5, 6, 7]
+
+        At the beginning of an episode, we cannot use frames from the previous
+        episode. If the episode began at frame 6, the history becomes:
+            max([4, 5, 6, 7], 6) -> [6, 6, 6, 7]
         """
         return np.maximum(
             np.arange(-self.frame_history_len + 1, 1) + latest_framebuffer_idx,
@@ -198,7 +248,9 @@ class MemoryEfficientReplayBuffer:
 
         self.current_trajectory_begin = self.size
 
-        # Insert the observation.
+        # Insert the first frame of the new episode. We do not yet have a full
+        # transition to store, but we need this frame to build the next stacked
+        # observation history.
         self.current_trajectory_framebuffer_begin = self._insert_frame(observation)
         # Compute, but don't store until we have a next observation.
         self.recent_observation_framebuffer_idcs = self._compute_frame_history_idcs(
@@ -226,6 +278,9 @@ class MemoryEfficientReplayBuffer:
                 done=done,
             )
         """
+        # This buffer receives only the newest single frame of next_observation,
+        # not the whole stack. The previous stack is already represented by
+        # `recent_observation_framebuffer_idcs`.
         if isinstance(reward, (float, int)):
             reward = np.array(reward)
         if isinstance(done, bool):
@@ -248,6 +303,11 @@ class MemoryEfficientReplayBuffer:
         assert next_observation.shape == self.observation_shape
         assert done.shape == ()
 
+        # Store the current stacked observation as frame indices, plus the
+        # scalar transition data. Example:
+        #   observation_framebuffer_idcs[row] = [10, 11, 12, 13]
+        #   actions[row] = 2
+        #   rewards[row] = 1.0
         self.observation_framebuffer_idcs[
             self.size % self.max_size
         ] = self.recent_observation_framebuffer_idcs

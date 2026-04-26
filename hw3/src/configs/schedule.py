@@ -20,6 +20,8 @@ class ConstantSchedule(object):
 
 
 def linear_interpolation(l, r, alpha):
+    # Move alpha fraction of the way from left value l to right value r.
+    # Example: l=1.0, r=0.1, alpha=0.5 -> 0.55.
     return l + alpha * (r - l)
 
 
@@ -42,6 +44,8 @@ class PiecewiseSchedule(object):
             `endpoints` this value is returned. If None then AssertionError is
             raised when outside value is requested.
         """
+        # Endpoint times must be sorted so value(t) can scan adjacent intervals.
+        # Example endpoints: [(0, 1.0), (20000, 1.0), (500000, 0.01)].
         idxes = [e[0] for e in endpoints]
         assert idxes == sorted(idxes)
         self._interpolation = interpolation
@@ -50,12 +54,20 @@ class PiecewiseSchedule(object):
 
     def value(self, t):
         """See Schedule.value"""
+        # Check each adjacent pair of endpoints as one interval.
+        # Example intervals:
+        #   (0, 1.0) -> (20000, 1.0)
+        #   (20000, 1.0) -> (500000, 0.01)
         for (l_t, l), (r_t, r) in zip(self._endpoints[:-1], self._endpoints[1:]):
             if l_t <= t and t < r_t:
+                # alpha is how far t is between the left and right endpoint.
+                # Example: halfway through the interval gives alpha=0.5.
                 alpha = float(t - l_t) / (r_t - l_t)
                 return self._interpolation(l, r, alpha)
 
-        # t does not belong to any of the pieces, so doom.
+        # If t is before the first interval or after the last interval, use the
+        # configured fallback value. For DQN epsilon, this keeps epsilon fixed
+        # after the final decay endpoint.
         assert self._outside_value is not None
         return self._outside_value
 
