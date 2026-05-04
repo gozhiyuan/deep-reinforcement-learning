@@ -62,10 +62,24 @@ def run_training_loop(config: dict, logger: Logger, args: argparse.Namespace):
             action = env.action_space.sample()
         else:
             # TODO(Section 3.1): Select an action
-            action = None
+            action = agent.get_action(observation)
             # ENDTODO
 
-        # Step the environment and add the data to the replay buffer
+        # Step the environment with a continuous action vector and store the
+        # transition in replay.
+        #
+        # SAC configs in this homework use MuJoCo state-vector observations,
+        # not image observations, so there is no CNN encoder in this path.
+        # The actor/critic networks are MLPs over these flat vectors:
+        #   InvertedPendulum-v4: observation.shape == (4,),  action.shape == (1,)
+        #   Hopper-v4:           observation.shape == (11,), action.shape == (3,)
+        #   HalfCheetah-v4:      observation.shape == (17,), action.shape == (6,)
+        #
+        # env.step(action) returns:
+        #   next_observation: same shape as observation, e.g. (4,)
+        #   reward: scalar float, shape ()
+        #   done: scalar bool, shape ()
+        #   info: dict with wrapper metadata such as episode stats/truncation
         next_observation, reward, done, info = env.step(action)
         replay_buffer.insert(
             observation=observation,
@@ -87,8 +101,17 @@ def run_training_loop(config: dict, logger: Logger, args: argparse.Namespace):
         # Train the agent
         if step >= config["training_starts"]:
             # TODO(Section 3.1): Sample a batch of config["batch_size"] transitions from the replay buffer
-            batch = None
-            update_info = None
+            batch = replay_buffer.sample(config["batch_size"])
+            batch = ptu.from_numpy(batch)
+
+            update_info = agent.update(
+                batch["observations"],
+                batch["actions"],
+                batch["rewards"],
+                batch["next_observations"],
+                batch["dones"],
+                step,
+            )
             # ENDTODO
 
             # Logging

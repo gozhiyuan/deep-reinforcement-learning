@@ -7,18 +7,40 @@ from typing import Union
 def make_multi_normal(
     mean: torch.Tensor, std: Union[float, torch.Tensor]
 ) -> D.Distribution:
+    """Create a diagonal Gaussian distribution over continuous action vectors.
+
+    mean/std usually have shape (batch_size, action_dim). D.Normal(mean, std)
+    treats every scalar action component as a separate random variable, so its
+    log_prob(action) would have shape (batch_size, action_dim).
+
+    D.Independent(..., reinterpreted_batch_ndims=1) says: the last batch
+    dimension is actually one vector-valued action event. After this wrapping,
+    sample() still returns (batch_size, action_dim), but log_prob(action)
+    sums across action_dim and returns one log probability per action vector:
+        (batch_size,)
+    """
     if isinstance(std, float):
         std = torch.tensor(std, device=mean.device)
 
     if std.shape == ():
         std = std.expand(mean.shape)
 
+    # Independent action dimensions with a diagonal covariance matrix:
+    #   action_i ~ Normal(mean_i, std_i)
+    # The wrapper makes the full action vector one event for log_prob/entropy.
     return D.Independent(D.Normal(mean, std), reinterpreted_batch_ndims=1)
 
 
 def make_tanh_transformed(
     mean: torch.Tensor, std: Union[float, torch.Tensor]
 ) -> D.Distribution:
+    """Create a tanh-squashed diagonal Gaussian for normalized actions.
+
+    SAC commonly samples an unconstrained Gaussian action and then applies tanh
+    so each action component lies in (-1, 1). D.TransformedDistribution handles
+    the tanh transform and its log-probability correction. D.Independent again
+    turns the per-dimension scalar distributions into one action-vector event.
+    """
     if isinstance(std, float):
         std = torch.tensor(std, device=mean.device)
 
@@ -37,6 +59,7 @@ def make_tanh_transformed(
 def make_truncated_normal(
     mean: torch.Tensor, std: Union[float, torch.Tensor]
 ) -> D.Distribution:
+    """Create a diagonal Gaussian truncated to [-1, 1] per action dimension."""
     if isinstance(std, float):
         std = torch.tensor(std, device=mean.device)
 
